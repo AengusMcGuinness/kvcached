@@ -750,6 +750,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 # LRU evictable pool: blocks with ref_cnt==0 retained for
                 # cross-request prefix reuse. Insertion order = LRU order.
                 self._evictable_blocks: OrderedDict[int, KVCacheBlock] = OrderedDict()
+                # Cumulative cached-prefix blocks dropped, keyed by why they
+                # were dropped. "shrink" is a colocated engine claiming GPU
+                # pages; these are the blocks a lower tier could retain.
+                self._eviction_counts: dict[str, int] = {}
+                self._eviction_last_log = 0.0
                 from kvcached.integration.vllm.page_eviction import PageEvictionIndex
 
                 self._page_eviction = (
@@ -934,7 +939,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
             def _evict_blocks_from_pool(self,
                                         num_to_evict: int,
-                                        page_aware: bool = True) -> int:
+                                        page_aware: bool = True,
+                                        reason: str = "other") -> int:
                 """Evict blocks from evictable pool, free to kvcached.
 
                 With page_aware set, prefers victims that empty whole pages so
@@ -967,10 +973,24 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             if len(ordered) == num_to_evict:
                                 break
 
-                return self._evict_block_ids(ordered)
+                return self._evict_block_ids(ordered, reason=reason)
 
-            def _evict_block_ids(self, block_ids: list[int]) -> int:
+            def _record_eviction(self, reason: str, num_blocks: int) -> None:
+                """Count dropped prefix blocks; log every shrink, others at most every 5 s."""
+                if num_blocks <= 0:
+                    return
+                self._eviction_counts[reason] = self._eviction_counts.get(reason, 0) + num_blocks
+                now = time.monotonic()
+                if reason != "shrink" and now - self._eviction_last_log < 5.0:
+                    return
+                self._eviction_last_log = now
+                logger.info(
+                    "Prefix eviction: reason=%s blocks=%d totals=%s",
+                    reason, num_blocks, dict(self._eviction_counts))
+
+            def _evict_block_ids(self, block_ids: list[int], reason: str = "other") -> int:
                 """Drop evictable blocks from the prefix cache, free to kvcached."""
+                self._record_eviction(reason, len(block_ids))
                 for bid in block_ids:
                     block = self._remove_evictable(bid)
                     key = self._block_id_to_key.pop(bid, None)
@@ -998,7 +1018,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 excess = self.kv_cache_manager.shrink_excess_pages()
                 if excess > 0:
                     self._evict_block_ids(self._page_eviction.victims(
-                        len(self._evictable_blocks), max_pages=excess))
+                        len(self._evictable_blocks), max_pages=excess), reason="shrink")
 
             def get_new_blocks(
                 self, num_blocks: int
@@ -1019,7 +1039,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                             # memory and would evict a newer prefix over the
                             # LRU victim. Keep pure LRU here.
                             self._evict_blocks_from_pool(
-                                num_blocks - kvcached_free, page_aware=False)
+                                num_blocks - kvcached_free, page_aware=False,
+                                reason="shortage")
                     block_ids = self.kv_cache_manager.alloc(num_blocks)
                     if block_ids is not None:
                         break
@@ -1107,7 +1128,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if (self.max_cached_blocks >= 0
                         and len(self._evictable_blocks) > self.max_cached_blocks):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
-                    self._evict_blocks_from_pool(excess)
+                    self._evict_blocks_from_pool(excess, reason="cap")
                 if getattr(self.kv_cache_manager, "in_shrink", False) is True:
                     # Finished requests may leave whole pages to cached prefixes.
                     self._reclaim_for_shrink()
@@ -1132,6 +1153,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         ids_to_free.append(bid)
 
                 if ids_to_free:
+                    self._record_eviction("engine", len(ids_to_free))
                     self._free_block_ids(ids_to_free)
                 if removed:
                     logger.debug(f"Evicted {removed} blocks from prefix cache")

@@ -292,9 +292,9 @@ def _record_eviction_threads(pool, monkeypatch) -> List[str]:
     threads: List[str] = []
     evict = pool._evict_block_ids
 
-    def recording(block_ids):
+    def recording(block_ids, **kwargs):
         threads.append(threading.current_thread().name)
-        return evict(block_ids)
+        return evict(block_ids, **kwargs)
 
     monkeypatch.setattr(pool, "_evict_block_ids", recording)
     return threads
