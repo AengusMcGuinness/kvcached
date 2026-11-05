@@ -19,6 +19,7 @@ from queue import Queue
 from typing import TYPE_CHECKING, Any, Collection, Iterable, Mapping, Optional
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
+from kvcached.integration.vllm import cpu_offload
 from kvcached.integration.version_utils import (
     VersionAwarePatch,
     VersionManager,
@@ -781,8 +782,40 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def _get_one_cached_block(self, key: Any) -> Optional[KVCacheBlock]:
                 blocks = self._cached_blocks.get(key)
                 if not blocks:
-                    return None
+                    return self._restore_from_cpu(key)
                 return next(iter(blocks.values()))
+
+            def _restore_from_cpu(self, key: Any) -> Optional[KVCacheBlock]:
+                """Bring a shrink-evicted prefix block back from CPU memory.
+
+                The restored block re-enters the pool exactly like a block
+                left by a finished request: cached, unreferenced, evictable.
+                """
+                if not cpu_offload.has(key):
+                    return None
+                # Allocate like any new block: under memory pressure this evicts
+                # the least recently used unreferenced cached blocks. Blocks this
+                # lookup just restored are the most recent, so they are kept.
+                try:
+                    (block,) = self.get_new_blocks(1)
+                except KVCachePoolExhausted:
+                    cpu_offload.note_no_free_block()
+                    return None
+                block.ref_cnt = 0
+                bid = block.block_id
+                if not cpu_offload.restore(key, int.from_bytes(key[-4:], "big"), bid):
+                    self._free_block_ids([bid])
+                    return None
+                self._index_restored_block(key, block)
+                self._evictable_blocks[bid] = block
+                if self._page_eviction is not None:
+                    self._page_eviction.add(bid)
+                return block
+
+            def _index_restored_block(self, key: Any, block: KVCacheBlock) -> None:
+                _set_block_hash(block, key)
+                self._cached_blocks.setdefault(key, {})[block.block_id] = block
+                self._block_id_to_key[block.block_id] = key
 
             def _remove_cached_block(
                 self, key: Any, block_id: int
@@ -991,6 +1024,12 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def _evict_block_ids(self, block_ids: list[int], reason: str = "other") -> int:
                 """Drop evictable blocks from the prefix cache, free to kvcached."""
                 self._record_eviction(reason, len(block_ids))
+                if reason == "shrink" and cpu_offload.ENABLED:
+                    # Copy before the keys are dropped and the pages unmapped.
+                    cpu_offload.save(
+                        [(key, int.from_bytes(key[-4:], "big"), bid) for bid in block_ids
+                         if (key := self._block_id_to_key.get(bid)) is not None],
+                        reason)
                 for bid in block_ids:
                     block = self._remove_evictable(bid)
                     key = self._block_id_to_key.pop(bid, None)

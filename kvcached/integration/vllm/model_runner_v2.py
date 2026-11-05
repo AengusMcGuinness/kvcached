@@ -12,6 +12,7 @@ from math import prod
 from typing import Any
 
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
+from kvcached.integration.vllm import cpu_offload
 from kvcached.kv_geometry import check_page_geometry
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
@@ -194,7 +195,7 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
                 f"Pick an attention backend that accepts {spec.block_size}-token "
                 "blocks (e.g. --attention-backend TRITON_ATTN)."
             )
-        placements.append((tensor, spec, kernel_size))
+        placements.append((tensor, spec, kernel_size, group_id))
     per_pool_bytes = torch.cuda.get_device_properties(device).total_memory // geometry.num_pools
     page_size = get_page_size_for_block(geometry.page_bytes, PAGE_SIZE)
     per_pool_bytes = per_pool_bytes // page_size * page_size
@@ -211,7 +212,7 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
     )
 
     caches: dict[str, Any] = {}
-    for tensor, spec, kernel_size in placements:
+    for tensor, spec, kernel_size, _ in placements:
         if CONTIGUOUS_LAYOUT:
             views = create_kv_cache_views(
                 raw[0], spec, config.num_blocks, layout, tensor, kernel_size
@@ -235,6 +236,18 @@ def allocate_kv_cache(config: Any, device: Any, layout: Any, kernel_block_sizes=
         "kvcached MRV2 persistent allocation: pools=%d page_bytes=%d blocks=%d layout=%s",
         geometry.num_pools, geometry.page_bytes, config.num_blocks, layout.name,
     )
+    if cpu_offload.ENABLED:
+        from vllm.v1.kv_cache_interface import AttentionSpec
+
+        blocks_dim = layout.name.index("B")
+        by_group: dict[int, list[Any]] = {}
+        for tensor, spec, _, group_id in placements:
+            if isinstance(spec, AttentionSpec):
+                by_group.setdefault(group_id, []).extend(caches[name] for name in tensor.layers)
+        for group_id, views in by_group.items():
+            if all(isinstance(v, torch.Tensor) for v in views):
+                cpu_offload.register_kv_tensors(
+                    group_id, views, blocks_dim, views[0].shape[blocks_dim] // config.num_blocks)
     return caches
 
 

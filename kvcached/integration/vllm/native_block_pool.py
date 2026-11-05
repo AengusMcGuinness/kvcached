@@ -8,6 +8,9 @@ from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
+from kvcached.integration.vllm import cpu_offload
+from kvcached.utils import KVCachePoolExhausted
+
 
 class NativeBlockPoolMixin:
     """Combine native hash indexing with elastic ownership and copy lifetimes."""
@@ -38,7 +41,71 @@ class NativeBlockPoolMixin:
     def get_cached_block(self, block_hash: Any, kv_cache_group_ids: list[int]) -> Any:
         if not self.enable_prefix_cache:
             return None
-        return self._native_block_pool.get_cached_block(self, block_hash, kv_cache_group_ids)
+        hit = self._native_block_pool.get_cached_block(self, block_hash, kv_cache_group_ids)
+        if hit is not None or not cpu_offload.ENABLED:
+            return hit
+        # A GPU miss in any group: bring shrink-evicted blocks back from CPU.
+        # restore_prefix() normally restored them already; this is the fallback.
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+        blocks = []
+        for group_id in kv_cache_group_ids:
+            key = make_block_hash_with_group_id(block_hash, group_id)
+            block = (self.cached_block_hash_to_block.get_one_block(key)
+                     or self._restore_from_cpu(key))
+            if block is None:
+                return None
+            blocks.append(block)
+        return blocks
+
+    def restore_prefix(self, block_hashes: Sequence[Any], max_blocks: int) -> None:
+        """Restore a request's saved prefix blocks (single KV group) in one batch.
+
+        Walks the request's block hashes from the start, skips blocks already on
+        the GPU, and stops at the first block that is neither on the GPU nor in
+        the CPU store, since a prefix hit cannot extend past it.
+        """
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+        keys = []
+        on_gpu = []
+        for block_hash in list(block_hashes)[:max_blocks]:
+            key = make_block_hash_with_group_id(block_hash, 0)
+            block = self.cached_block_hash_to_block.get_one_block(key)
+            if block is not None:
+                on_gpu.append(block)
+                continue
+            if not cpu_offload.stored(key):
+                break
+            keys.append(key)
+        if not keys:
+            return
+        # Allocation below may evict LRU cached blocks; keep this prefix's own.
+        for block in on_gpu:
+            if block.block_id in self._evictable_blocks:
+                self._evictable_blocks.move_to_end(block.block_id)
+        try:
+            blocks = self.get_new_blocks(len(keys))
+        except KVCachePoolExhausted:
+            cpu_offload.note_no_free_block()
+            return
+        block_ids = [block.block_id for block in blocks]
+        if not cpu_offload.restore_many(keys, 0, block_ids):
+            for block in blocks:
+                block.ref_cnt = 0
+            self._free_block_ids(block_ids)
+            return
+        for key, block in zip(keys, blocks):
+            # Re-enter the pool like a block left by a finished request.
+            block.ref_cnt = 0
+            self._index_restored_block(key, block)
+            self._evictable_blocks[block.block_id] = block
+            if self._page_eviction is not None:
+                self._page_eviction.add(block.block_id)
+
+    def _index_restored_block(self, key: Any, block: Any) -> None:
+        # Restored blocks are always full blocks, so no partial token count.
+        self._insert_block_hash(key, block, None)
 
     def cache_full_blocks(
         self,

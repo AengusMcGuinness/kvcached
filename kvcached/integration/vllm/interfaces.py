@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
+from kvcached.integration.vllm import cpu_offload
 from kvcached.kv_cache_manager import KVCacheManager
 from kvcached.observability import (
     build_runtime_snapshot,
@@ -785,6 +786,12 @@ def alloc_kv_cache(
     }
 
     if not is_hybrid_linear:
+        if not packed_kv:
+            # The contiguous and non-contiguous views size the block dim
+            # differently, so derive kernel blocks per kvcached block from it.
+            cpu_offload.register_kv_tensors(
+                group_id, kv_tensors, blocks_dim_idx,
+                kv_tensors[0].shape[blocks_dim_idx] // num_blocks_per_layer)
         if return_meta:
             return kv_tensors, meta  # type: ignore[return-value]
         return kv_tensors
